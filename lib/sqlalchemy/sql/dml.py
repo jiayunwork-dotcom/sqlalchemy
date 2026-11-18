@@ -417,6 +417,8 @@ class UpdateBase(
     _supplemental_returning: Optional[Tuple[_ColumnsClauseElement, ...]] = None
     _returning: Tuple[_ColumnsClauseElement, ...] = ()
 
+    _sort_by_parameter_order: bool = False
+
     is_dml = True
 
     def _generate_fromclause_column_proxies(
@@ -787,14 +789,29 @@ class UpdateBase(
 
         :param \*cols: series of columns, SQL expressions, or whole tables
          entities to be returned.
-        :param sort_by_parameter_order: for a batch INSERT that is being
-         executed against multiple parameter sets, organize the results of
-         RETURNING so that the returned rows correspond to the order of
-         parameter sets passed in.  This applies only to an :term:`executemany`
-         execution for supporting dialects and typically makes use of the
+        :param sort_by_parameter_order: for a batch INSERT or UPDATE that is
+         being executed against multiple parameter sets, organize the results
+         of RETURNING so that the returned rows correspond to the order of
+         parameter sets passed in.
+
+         For INSERT, this applies to an :term:`executemany` execution for
+         supporting dialects and typically makes use of the
          :term:`insertmanyvalues` feature.
 
+         For UPDATE, this applies to the
+         :ref:`ORM bulk UPDATE by primary key <orm_queryguide_bulk_update>`
+         form of :meth:`_orm.Session.execute` given a list of parameter
+         dictionaries, where it enables an ordered, RETURNING-driven
+         delivery of the updated rows; see the ``bulk_update_page_size``
+         execution option for batch sizing.
+
          .. versionadded:: 2.0.10
+
+         .. versionchanged:: 2.0.49 The
+            :paramref:`_dml.UpdateBase.returning.sort_by_parameter_order`
+            parameter is now also accepted by :class:`_dml.Update`
+            statements, where it enables ordered RETURNING delivery for
+            ORM bulk UPDATE by primary key.
 
          .. seealso::
 
@@ -823,10 +840,10 @@ class UpdateBase(
             coercions.expect(roles.ColumnsClauseRole, c) for c in cols
         )
         if sort_by_parameter_order:
-            if not self.is_insert:
+            if not (self.is_insert or self.is_update):
                 raise exc.ArgumentError(
                     "The 'sort_by_parameter_order' argument to returning() "
-                    "only applies to INSERT statements"
+                    "only applies to INSERT and UPDATE statements"
                 )
             self._sort_by_parameter_order = True
         return self
@@ -1555,6 +1572,7 @@ class Update(DMLWhereBase, ValuesBase):
                 "_return_defaults_columns",
                 InternalTraversal.dp_clauseelement_tuple,
             ),
+            ("_sort_by_parameter_order", InternalTraversal.dp_boolean),
         ]
         + HasPrefixes._has_prefixes_traverse_internals
         + DialectKWArgs._dialect_kwargs_traverse_internals
@@ -1620,24 +1638,33 @@ class Update(DMLWhereBase, ValuesBase):
         return self
 
     if TYPE_CHECKING:
-        # START OVERLOADED FUNCTIONS self.returning ReturningUpdate 1-8
+        # START OVERLOADED FUNCTIONS self.returning ReturningUpdate 1-8 ", *, sort_by_parameter_order: bool = False"  # noqa: E501
 
         # code within this block is **programmatically,
         # statically generated** by tools/generate_tuple_map_overloads.py
 
         @overload
         def returning(
-            self, __ent0: _TCCA[_T0]
+            self, __ent0: _TCCA[_T0], *, sort_by_parameter_order: bool = False
         ) -> ReturningUpdate[Tuple[_T0]]: ...
 
         @overload
         def returning(
-            self, __ent0: _TCCA[_T0], __ent1: _TCCA[_T1]
+            self,
+            __ent0: _TCCA[_T0],
+            __ent1: _TCCA[_T1],
+            *,
+            sort_by_parameter_order: bool = False,
         ) -> ReturningUpdate[Tuple[_T0, _T1]]: ...
 
         @overload
         def returning(
-            self, __ent0: _TCCA[_T0], __ent1: _TCCA[_T1], __ent2: _TCCA[_T2]
+            self,
+            __ent0: _TCCA[_T0],
+            __ent1: _TCCA[_T1],
+            __ent2: _TCCA[_T2],
+            *,
+            sort_by_parameter_order: bool = False,
         ) -> ReturningUpdate[Tuple[_T0, _T1, _T2]]: ...
 
         @overload
@@ -1647,6 +1674,8 @@ class Update(DMLWhereBase, ValuesBase):
             __ent1: _TCCA[_T1],
             __ent2: _TCCA[_T2],
             __ent3: _TCCA[_T3],
+            *,
+            sort_by_parameter_order: bool = False,
         ) -> ReturningUpdate[Tuple[_T0, _T1, _T2, _T3]]: ...
 
         @overload
@@ -1657,6 +1686,8 @@ class Update(DMLWhereBase, ValuesBase):
             __ent2: _TCCA[_T2],
             __ent3: _TCCA[_T3],
             __ent4: _TCCA[_T4],
+            *,
+            sort_by_parameter_order: bool = False,
         ) -> ReturningUpdate[Tuple[_T0, _T1, _T2, _T3, _T4]]: ...
 
         @overload
@@ -1668,6 +1699,8 @@ class Update(DMLWhereBase, ValuesBase):
             __ent3: _TCCA[_T3],
             __ent4: _TCCA[_T4],
             __ent5: _TCCA[_T5],
+            *,
+            sort_by_parameter_order: bool = False,
         ) -> ReturningUpdate[Tuple[_T0, _T1, _T2, _T3, _T4, _T5]]: ...
 
         @overload
@@ -1680,6 +1713,8 @@ class Update(DMLWhereBase, ValuesBase):
             __ent4: _TCCA[_T4],
             __ent5: _TCCA[_T5],
             __ent6: _TCCA[_T6],
+            *,
+            sort_by_parameter_order: bool = False,
         ) -> ReturningUpdate[Tuple[_T0, _T1, _T2, _T3, _T4, _T5, _T6]]: ...
 
         @overload
@@ -1693,6 +1728,8 @@ class Update(DMLWhereBase, ValuesBase):
             __ent5: _TCCA[_T5],
             __ent6: _TCCA[_T6],
             __ent7: _TCCA[_T7],
+            *,
+            sort_by_parameter_order: bool = False,
         ) -> ReturningUpdate[
             Tuple[_T0, _T1, _T2, _T3, _T4, _T5, _T6, _T7]
         ]: ...
@@ -1701,11 +1738,17 @@ class Update(DMLWhereBase, ValuesBase):
 
         @overload
         def returning(
-            self, *cols: _ColumnsClauseArgument[Any], **__kw: Any
+            self,
+            *cols: _ColumnsClauseArgument[Any],
+            sort_by_parameter_order: bool = False,
+            **__kw: Any,
         ) -> ReturningUpdate[Any]: ...
 
         def returning(
-            self, *cols: _ColumnsClauseArgument[Any], **__kw: Any
+            self,
+            *cols: _ColumnsClauseArgument[Any],
+            sort_by_parameter_order: bool = False,
+            **__kw: Any,
         ) -> ReturningUpdate[Any]: ...
 
 

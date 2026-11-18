@@ -103,11 +103,19 @@ class ReturnCombinationTests(fixtures.TestBase, AssertsCompiledSQL):
 
         meth = getattr(stmt, methname)
 
-        if construct in (update, delete):
+        if methname == "return_defaults" and construct in (update, delete):
             with expect_raises_message(
                 sa_exc.ArgumentError,
                 rf"The 'sort_by_parameter_order' argument to "
                 rf"{methname}\(\) only applies to INSERT statements",
+            ):
+                meth(t.c.id, sort_by_parameter_order=True)
+        elif methname == "returning" and construct is delete:
+            with expect_raises_message(
+                sa_exc.ArgumentError,
+                rf"The 'sort_by_parameter_order' argument to "
+                rf"{methname}\(\) only applies to INSERT and UPDATE "
+                rf"statements",
             ):
                 meth(t.c.id, sort_by_parameter_order=True)
         else:

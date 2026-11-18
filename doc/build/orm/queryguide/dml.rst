@@ -806,10 +806,105 @@ runs.
    primary key values.
 
 The RETURNING feature is not available when using the "bulk UPDATE by primary
-key" feature; the list of multiple parameter dictionaries necessarily makes use
-of DBAPI :term:`executemany`, which in its usual form does not typically
-support result rows.
+key" feature in its default form; the list of multiple parameter dictionaries
+necessarily makes use of DBAPI :term:`executemany`, which in its usual form
+does not typically support result rows.  However, an **ordered** form of bulk
+UPDATE that does return the updated rows is available; see the next section
+:ref:`orm_queryguide_bulk_update_returning_ordered`.
 
+.. _orm_queryguide_bulk_update_returning_ordered:
+
+Ordered Bulk UPDATE with RETURNING
+^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+.. versionadded:: 2.0.49
+
+The :ref:`orm_queryguide_bulk_update` feature may be combined with a
+:term:`RETURNING` clause that delivers the updated rows back to the caller
+**in the same relative order as the input parameter dictionaries**, by
+passing the :paramref:`_dml.UpdateBase.returning.sort_by_parameter_order`
+parameter to the :meth:`_dml.Update.returning` method, together with the
+``synchronize_session=False`` execution option::
+
+    >>> stmt = update(User).returning(User, sort_by_parameter_order=True)
+    >>> result = session.execute(
+    ...     stmt,
+    ...     [
+    ...         {"id": 3, "fullname": "Patrick Star"},
+    ...         {"id": 1, "fullname": "Spongebob Squarepants"},
+    ...         {"id": 5, "fullname": "Eugene H. Krabs"},
+    ...     ],
+    ...     execution_options={"synchronize_session": False},
+    ... )
+    {execsql}UPDATE user_account SET fullname=sa_bulk_update.set_fullname FROM (SELECT column1 AS pkm_0, column2 AS set_fullname
+    FROM (VALUES (?, ?), (?, ?), (?, ?))) AS sa_bulk_update WHERE user_account.id = sa_bulk_update.pkm_0 RETURNING id
+    [...] (3, 'Patrick Star', 1, 'Spongebob Squarepants', 5, 'Eugene H. Krabs')
+    SELECT user_account.id, user_account.name, user_account.fullname, user_account.species
+    FROM user_account JOIN (SELECT column1 AS k0, column2 AS idx
+    FROM (VALUES (?, ?), (?, ?), (?, ?))) AS sa_bulk_update_keys ON user_account.id = sa_bulk_update_keys.k0 ORDER BY sa_bulk_update_keys.idx
+    [...] (3, 0, 1, 1, 5, 2)
+    {stop}>>> [user.fullname for user in result.scalars()]
+    ['Patrick Star', 'Spongebob Squarepants', 'Eugene H. Krabs']
+
+In this mode, each page of input rows is written with a single
+``UPDATE ... FROM (VALUES ...)`` statement per mapped table (rather than
+:term:`executemany`), which is what allows RETURNING to be used; the updated
+rows are then loaded back through the usual ORM result and entity machinery
+in input order.  The RETURNING clause may request the full entity as above,
+or individual columns / labeled expressions, in which case the result
+behaves like the equivalent :func:`_sql.select` (e.g. :meth:`_engine.Result.mappings`,
+:meth:`_engine.Result.scalars` and :meth:`_engine.Result.keys`)::
+
+    >>> result = session.execute(
+    ...     update(User).returning(User.fullname.label("fn"), sort_by_parameter_order=True),
+    ...     [{"id": 1, "fullname": "Spongebob Squarepants"}],
+    ...     execution_options={"synchronize_session": False},
+    ... )
+    >>> result.keys()
+    ['fn']
+    >>> result.mappings().all()
+    [{'fn': 'Spongebob Squarepants'}]
+
+Behavioral notes for ordered bulk UPDATE:
+
+* Each parameter dictionary must include the **full, non-NULL primary key**
+  of the row to update, and at least one non-primary-key column assignment.
+  Duplicate primary keys within the batch are rejected, and primary key
+  columns themselves are never part of the SET clause.
+
+* Rows whose primary key does not exist in the target table, or which do not
+  match the statement's WHERE criteria, are **skipped** and simply do not
+  appear in the result.  WHERE criteria are limited to expressions over
+  plain columns of the base table plus bind parameters; bind parameter keys
+  may be supplied per-row within the parameter dictionaries.
+
+* The result rows correspond to the **input order** of the parameter
+  dictionaries, not to any database-side ordering.
+
+* For joined table inheritance, the base and sub tables are updated
+  consistently: a key that is not matched on the base table is not updated
+  on the sub table either, and returned entities carry the updated
+  attributes of all mapped tables.
+
+* ``synchronize_session=False`` is required.  Already-loaded objects are
+  refreshed in place when ``populate_existing=True`` is also passed;
+  otherwise already-loaded objects are not refreshed.
+
+* The batch is processed in pages whose size is controlled by the
+  ``bulk_update_page_size`` execution option (default 100), further reduced
+  as needed to respect the driver's bind parameter limit.
+
+* This mode is currently supported for the **SQLite** dialect only (SQLite
+  3.35+).  Mapper version counting (``version_id_col``), relationship
+  attributes, and SQL-expression assignments are not supported and are
+  rejected before any UPDATE is emitted.
+
+.. seealso::
+
+    :ref:`orm_queryguide_bulk_insert_returning_ordered` - the analogous
+    feature for bulk INSERT
+
+    :paramref:`_dml.UpdateBase.returning.sort_by_parameter_order`
 
 .. versionchanged:: 2.0  Passing an :class:`_dml.Update` construct to the
    :meth:`_orm.Session.execute` method along with a list of parameter

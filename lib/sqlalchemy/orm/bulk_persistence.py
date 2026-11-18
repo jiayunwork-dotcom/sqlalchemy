@@ -42,15 +42,20 @@ from ..engine import result as _result
 from ..sql import coercions
 from ..sql import dml
 from ..sql import expression
+from ..sql import functions
 from ..sql import roles
 from ..sql import select
 from ..sql import sqltypes
+from ..sql import visitors
 from ..sql.base import _entity_namespace_key
 from ..sql.base import CompileState
 from ..sql.base import Options
 from ..sql.dml import DeleteDMLState
 from ..sql.dml import InsertDMLState
 from ..sql.dml import UpdateDMLState
+from ..sql.elements import BindParameter
+from ..sql.schema import Column
+from ..sql.selectable import Select
 from ..util import EMPTY_DICT
 from ..util.typing import Literal
 
@@ -369,6 +374,423 @@ def _bulk_update(
         return _result.null_result()
 
 
+def _validate_bulk_update_where(base_table, where_criteria):
+    """Validate the WHERE criteria of an ordered bulk UPDATE statement.
+
+    Only expressions composed of plain columns of the base table, literal
+    values and bind parameters are supported in this version.  Returns a
+    mapping of bind parameter key -> BindParameter for the non-expanding
+    bind parameters found; raises InvalidRequestError for anything else.
+
+    """
+    where_bp: Dict[str, BindParameter] = {}
+    for crit in where_criteria:
+        for el in visitors.iterate(crit):
+            if isinstance(el, BindParameter):
+                # expanding bind parameters (e.g. col.in_([...])) are left
+                # in place as statement-level constants; they cannot be
+                # supplied per-row.
+                if not el.expanding:
+                    where_bp[el.key] = el
+            elif isinstance(el, Column):
+                if el.table is not base_table:
+                    raise sa_exc.InvalidRequestError(
+                        "bulk UPDATE with sort_by_parameter_order=True "
+                        "supports WHERE criteria only over plain columns of "
+                        f"the base table {base_table.name!r}; got column "
+                        f"{el!r} of table {el.table.name!r}"
+                    )
+            elif isinstance(
+                el,
+                (
+                    Select,
+                    expression.Exists,
+                    expression.Join,
+                    expression.Alias,
+                    expression.TextClause,
+                    functions.FunctionElement,
+                    dml.UpdateBase,
+                ),
+            ):
+                raise sa_exc.InvalidRequestError(
+                    "bulk UPDATE with sort_by_parameter_order=True "
+                    "supports WHERE criteria composed of plain base-table "
+                    "columns, literal values and bind parameters; got "
+                    f"unsupported element {el!r}"
+                )
+    return where_bp
+
+
+def _make_bulk_update_values_from(col_specs, nrows, alias):
+    """Build a FROM-clause element holding one page of rows for an
+    ordered bulk UPDATE, of the form
+    ``(SELECT column1 AS <name0>, ... FROM (VALUES ...)) AS <alias>``.
+
+    ``col_specs`` is a list of ``(column_name, type)`` tuples.  The data
+    rows are rendered as bind parameters named ``<column_name>__<rownum>``
+    so that the statement remains cacheable for a given page size.
+
+    The subquery-wrapped VALUES form is used (rather than a ``WITH`` CTE)
+    so that the rendered UPDATE statement begins with the ``UPDATE``
+    keyword; the pysqlite driver only auto-BEGINs a transaction for
+    statements that begin with a DML keyword.
+
+    """
+    vals = expression.values(
+        *[
+            expression.column(f"c{j}", coltype)
+            for j, (colname, coltype) in enumerate(col_specs)
+        ]
+    ).data(
+        [
+            tuple(
+                expression.bindparam(f"{colname}__{i}", type_=coltype)
+                for j, (colname, coltype) in enumerate(col_specs)
+            )
+            for i in range(nrows)
+        ]
+    )
+    return (
+        select(
+            *[
+                expression.literal_column(f"column{j + 1}").label(colname)
+                for j, (colname, coltype) in enumerate(col_specs)
+            ]
+        )
+        .select_from(vals)
+        .subquery(alias)
+    )
+
+
+def _bulk_update_ordered(
+    mapper,
+    mappings,
+    session_transaction,
+    *,
+    use_orm_update_stmt,
+    page_size,
+    populate_existing,
+):
+    """Implement ordered ORM bulk UPDATE by primary key with RETURNING.
+
+    This is the backend for
+    ``Session.execute(update(Entity).returning(...,
+    sort_by_parameter_order=True), list_of_mappings)``.
+
+    Rather than relying on executemany-style UPDATE..RETURNING (which the
+    SQLite driver does not support), each page of rows is written with a
+    single ``UPDATE ... FROM (VALUES ...)`` statement per table; the base
+    table statement carries the statement's WHERE criteria and returns the
+    matched primary keys via RETURNING.  The matched keys then drive a
+    final ORM SELECT, joined against a ``VALUES`` list of
+    ``(primary key, input position)`` pairs, so that the updated rows are
+    loaded back through the regular ORM result/entity machinery in the
+    original input order.
+
+    """
+    base_mapper = mapper.base_mapper
+    session = session_transaction.session
+    connection = session_transaction.connection(base_mapper)
+    dialect = connection.dialect
+
+    if dialect.name != "sqlite" or not dialect.update_returning:
+        raise sa_exc.InvalidRequestError(
+            "bulk UPDATE with sort_by_parameter_order=True is currently "
+            "only supported for the SQLite dialect with RETURNING support "
+            "(SQLite 3.35+)"
+        )
+    if base_mapper.version_id_col is not None:
+        raise sa_exc.InvalidRequestError(
+            "bulk UPDATE with sort_by_parameter_order=True does not "
+            "support mapper version_id_col / version counting"
+        )
+
+    orm_stmt = use_orm_update_stmt
+    base_table = base_mapper.local_table
+
+    if orm_stmt._values or orm_stmt._ordered_values:
+        raise sa_exc.InvalidRequestError(
+            "bulk UPDATE with sort_by_parameter_order=True does not support "
+            "statement-level values() or ordered_values(); column "
+            "assignments are given per-row within the parameter dictionaries"
+        )
+
+    # validate WHERE criteria and collect bind parameters, before any SQL
+    where_bp = _validate_bulk_update_where(
+        base_table, orm_stmt._where_criteria
+    )
+
+    # work on copies so that caller-owned dictionaries are never mutated
+    mappings = [dict(m) for m in mappings]
+    _expand_composites(mapper, mappings)
+
+    base_pk_cols = mapper._pks_by_table[base_table]
+    pk_props = [mapper._columntoproperty[c].key for c in base_pk_cols]
+    column_prop_keys = {prop.key for prop in mapper.column_attrs}
+    where_key_set = set(where_bp)
+
+    mapping_keys = set()
+    for mapping in mappings:
+        mapping_keys.update(mapping)
+    # bind parameter keys that are actually supplied within the mappings;
+    # these are per-row WHERE parameters, not assignments
+    user_where_keys = [k for k in where_bp if k in mapping_keys]
+
+    # ---- validate all mappings up front, before emitting any SQL --------
+    rows = []
+    seen_pks = set()
+    for idx, mapping in enumerate(mappings):
+        for key in mapping:
+            if key in where_key_set:
+                continue
+            if key not in column_prop_keys:
+                if key in mapper._props:
+                    raise sa_exc.InvalidRequestError(
+                        f"Can't use property {key!r} in bulk UPDATE with "
+                        "sort_by_parameter_order=True; only plain mapped "
+                        "column assignments are supported"
+                    )
+                raise sa_exc.ArgumentError(
+                    f"Can't find mapped property named {key!r} on mapper "
+                    f"{mapper}"
+                )
+        pk_tuple = tuple(mapping.get(k) for k in pk_props)
+        if any(v is None for v in pk_tuple):
+            missing = [
+                str(c)
+                for c, k in zip(base_pk_cols, pk_props)
+                if mapping.get(k) is None
+            ]
+            raise sa_exc.InvalidRequestError(
+                f"No primary key value supplied for column(s) "
+                f"{', '.join(missing)}; per-row ORM Bulk UPDATE by Primary "
+                "Key requires that records contain primary key values"
+            )
+        if pk_tuple in seen_pks:
+            raise sa_exc.InvalidRequestError(
+                f"Duplicate primary key {pk_tuple!r} in bulk UPDATE mappings; "
+                "each record must have a distinct primary key"
+            )
+        seen_pks.add(pk_tuple)
+        assigns = {
+            k: v
+            for k, v in mapping.items()
+            if k not in pk_props and k not in where_key_set
+        }
+        if not assigns:
+            raise sa_exc.InvalidRequestError(
+                "Each record in bulk UPDATE with sort_by_parameter_order=True "
+                "must include at least one non-primary-key column assignment"
+            )
+        for value in assigns.values():
+            if isinstance(value, expression.ClauseElement) or hasattr(
+                value, "__clause_element__"
+            ):
+                raise sa_exc.InvalidRequestError(
+                    "SQL expression assignments are not supported in bulk "
+                    "UPDATE with sort_by_parameter_order=True"
+                )
+        rows.append((idx, pk_tuple, assigns, mapping))
+
+    # ---- group rows by assignment shape (stable, input order kept) ------
+    shape_groups = []
+    shape_to_group = {}
+    for row in rows:
+        shape = frozenset(row[2])
+        grp = shape_to_group.get(shape)
+        if grp is None:
+            grp = (shape, [])
+            shape_to_group[shape] = grp
+            shape_groups.append(grp)
+        grp[1].append(row)
+
+    tables = [
+        (table, tmapper)
+        for table, tmapper in base_mapper._sorted_tables.items()
+        if table in mapper._pks_by_table
+    ]
+
+    max_params = dialect.insertmanyvalues_max_parameters or 32700
+    n_pk = len(pk_props)
+    n_where = len(user_where_keys)
+    where_key_idx = {k: n for n, k in enumerate(user_where_keys)}
+    pk_to_idx = {row[1]: row[0] for row in rows}
+    compiled_cache_opt = {"compiled_cache": base_mapper._compiled_cache}
+
+    def _rewritten_where(cte):
+        def replace(el):
+            if isinstance(el, BindParameter) and el.key in where_key_idx:
+                return cte.c[f"w{where_key_idx[el.key]}"]
+            return None
+
+        return [
+            visitors.replacement_traverse(crit, {}, replace)
+            for crit in orm_stmt._where_criteria
+        ]
+
+    matched = []  # list of (input_idx, pk_tuple), in discovery order
+
+    for shape, group_rows in shape_groups:
+        per_row = n_pk + len(shape) + n_where
+        eff_page = min(page_size, max(1, max_params // per_row))
+        for page_start in range(0, len(group_rows), eff_page):
+            page = group_rows[page_start : page_start + eff_page]
+
+            # ---- base table: UPDATE..RETURNING pk, or matched-row SELECT
+            base_propkey_to_col = mapper._propkey_to_col[base_table]
+            base_shape_cols = [
+                (pk, col)
+                for pk, col in base_propkey_to_col.items()
+                if pk in shape
+            ]
+            col_specs = [
+                (f"pkm_{j}", c.type) for j, c in enumerate(base_pk_cols)
+            ]
+            col_specs += [(f"set_{pk}", c.type) for pk, c in base_shape_cols]
+            col_specs += [
+                (f"w{n}", where_bp[k].type)
+                for n, k in enumerate(user_where_keys)
+            ]
+            cte = _make_bulk_update_values_from(
+                col_specs, len(page), "sa_bulk_update"
+            )
+            params = {}
+            for i, (idx, pk_tuple, assigns, mapping) in enumerate(page):
+                for j in range(n_pk):
+                    params[f"pkm_{j}__{i}"] = pk_tuple[j]
+                for pk, c in base_shape_cols:
+                    params[f"set_{pk}__{i}"] = assigns[pk]
+                for n, k in enumerate(user_where_keys):
+                    params[f"w{n}__{i}"] = mapping.get(k, where_bp[k].value)
+
+            if base_shape_cols:
+                stmt = dml.Update(base_table).values(
+                    {c: cte.c[f"set_{pk}"] for pk, c in base_shape_cols}
+                )
+                for j, pkcol in enumerate(base_pk_cols):
+                    stmt = stmt.where(pkcol == cte.c[f"pkm_{j}"])
+                for crit in _rewritten_where(cte):
+                    stmt = stmt.where(crit)
+                stmt = stmt.returning(*base_pk_cols)
+            else:
+                # no base-table assignments in this shape; run a SELECT to
+                # determine the matched primary keys instead
+                stmt = select(*base_pk_cols).select_from(base_table)
+                stmt = stmt.join(
+                    cte,
+                    expression.and_(
+                        *[
+                            pkcol == cte.c[f"pkm_{j}"]
+                            for j, pkcol in enumerate(base_pk_cols)
+                        ]
+                    ),
+                )
+                for crit in _rewritten_where(cte):
+                    stmt = stmt.where(crit)
+
+            result = connection.execute(
+                stmt, params, execution_options=compiled_cache_opt
+            )
+            page_matched = [
+                (pk_to_idx[pk_tuple], pk_tuple)
+                for pk_tuple in (tuple(row) for row in result.all())
+            ]
+            matched.extend(page_matched)
+            page_matched_pks = {pk_tuple for _, pk_tuple in page_matched}
+            matched_rows = [row for row in page if row[1] in page_matched_pks]
+
+            # ---- sub tables: UPDATE filtered to the matched keys --------
+            for table, tmapper in tables:
+                if table is base_table:
+                    continue
+                propkey_to_col = mapper._propkey_to_col[table]
+                sub_shape_cols = [
+                    (pk, col)
+                    for pk, col in propkey_to_col.items()
+                    if pk in shape
+                ]
+                if not sub_shape_cols or not matched_rows:
+                    continue
+                sub_pk_cols = mapper._pks_by_table[table]
+                col_specs = [
+                    (f"pkm_{j}", c.type) for j, c in enumerate(sub_pk_cols)
+                ]
+                col_specs += [
+                    (f"set_{pk}", c.type) for pk, c in sub_shape_cols
+                ]
+                cte = _make_bulk_update_values_from(
+                    col_specs, len(matched_rows), "sa_bulk_update"
+                )
+                params = {}
+                for i, (idx, pk_tuple, assigns, mapping) in enumerate(
+                    matched_rows
+                ):
+                    for j in range(len(sub_pk_cols)):
+                        params[f"pkm_{j}__{i}"] = pk_tuple[j]
+                    for pk, c in sub_shape_cols:
+                        params[f"set_{pk}__{i}"] = assigns[pk]
+                stmt = dml.Update(table).values(
+                    {c: cte.c[f"set_{pk}"] for pk, c in sub_shape_cols}
+                )
+                for j, pkcol in enumerate(sub_pk_cols):
+                    stmt = stmt.where(pkcol == cte.c[f"pkm_{j}"])
+                connection.execute(
+                    stmt, params, execution_options=compiled_cache_opt
+                )
+
+    # ---- final SELECT: load the updated rows back in input order --------
+    returning = orm_stmt._returning
+    inner_exec_opts: OrmExecuteOptionsParameter = (
+        {"populate_existing": True} if populate_existing else util.EMPTY_DICT
+    )
+
+    if not matched:
+        stmt = (
+            select(*returning)
+            .select_from(mapper.persist_selectable)
+            .where(expression.false())
+        )
+        return session._execute_internal(
+            stmt, {}, execution_options=inner_exec_opts
+        )
+
+    matched.sort()
+    results = []
+    chunk_size = max(1, max_params // (n_pk + 1))
+    for chunk_start in range(0, len(matched), chunk_size):
+        chunk = matched[chunk_start : chunk_start + chunk_size]
+        col_specs = [(f"k{j}", c.type) for j, c in enumerate(base_pk_cols)]
+        col_specs += [("idx", sqltypes.Integer)]
+        keys_cte = _make_bulk_update_values_from(
+            col_specs, len(chunk), "sa_bulk_update_keys"
+        )
+        params = {}
+        for i, (idx, pk_tuple) in enumerate(chunk):
+            for j, value in enumerate(pk_tuple):
+                params[f"k{j}__{i}"] = value
+            params[f"idx__{i}"] = idx
+        stmt = select(*returning).select_from(mapper.persist_selectable)
+        stmt = stmt.join(
+            keys_cte,
+            expression.and_(
+                *[
+                    pkcol == keys_cte.c[f"k{j}"]
+                    for j, pkcol in enumerate(mapper.primary_key)
+                ]
+            ),
+        ).order_by(keys_cte.c.idx)
+        results.append(
+            session._execute_internal(
+                stmt, params, execution_options=inner_exec_opts
+            )
+        )
+
+    if len(results) == 1:
+        return results[0]
+    else:
+        return results[0].merge(*results[1:])
+
+
 def _expand_composites(mapper, mappings):
     composite_attrs = mapper.composites
     if not composite_attrs:
@@ -657,6 +1079,7 @@ class BulkUDCompileState(ORMDMLState):
         _matched_rows = None
         _identity_token = None
         _populate_existing: bool = False
+        _bulk_update_page_size: int = 100
 
     @classmethod
     def can_use_returning(
@@ -694,10 +1117,21 @@ class BulkUDCompileState(ORMDMLState):
                 "is_delete_using",
                 "is_update_from",
                 "dml_strategy",
+                "bulk_update_page_size",
             },
             execution_options,
             statement._execution_options,
         )
+        page_size = update_options._bulk_update_page_size
+        if (
+            isinstance(page_size, bool)
+            or not isinstance(page_size, int)
+            or page_size < 1
+        ):
+            raise sa_exc.ArgumentError(
+                "The 'bulk_update_page_size' execution option must be a "
+                f"positive integer; got {page_size!r}"
+            )
         bind_arguments["clause"] = statement
         try:
             plugin_subject = statement._propagate_attrs["plugin_subject"]
@@ -1618,6 +2052,41 @@ class BulkORMUpdate(BulkUDCompileState, UpdateDMLState):
         result: _result.Result[Any]
 
         if update_options._dml_strategy == "bulk":
+            if statement._sort_by_parameter_order:
+                # ordered bulk UPDATE by primary key with RETURNING
+                if update_options._synchronize_session is not False:
+                    raise sa_exc.InvalidRequestError(
+                        "bulk UPDATE with sort_by_parameter_order=True "
+                        "requires the synchronize_session=False execution "
+                        "option"
+                    )
+                if not statement._returning:
+                    raise sa_exc.InvalidRequestError(
+                        "bulk UPDATE with sort_by_parameter_order=True "
+                        "requires a RETURNING clause"
+                    )
+                mapper = update_options._subject_mapper
+                assert mapper is not None
+                assert session._transaction is not None
+                # note that Session.execute() coerces an empty list of
+                # parameters to {}, so an empty parameter set arrives here
+                # as an empty dict
+                ordered_mappings = (
+                    []
+                    if not params
+                    else (
+                        [params] if isinstance(params, dict) else params
+                    )
+                )
+                return _bulk_update_ordered(
+                    mapper,
+                    cast("Iterable[Dict[str, Any]]", ordered_mappings),
+                    session._transaction,
+                    use_orm_update_stmt=statement,
+                    page_size=update_options._bulk_update_page_size,
+                    populate_existing=update_options._populate_existing,
+                )
+
             enable_check_rowcount = not statement._where_criteria
 
             assert update_options._synchronize_session != "fetch"

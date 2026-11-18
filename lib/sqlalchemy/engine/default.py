@@ -1364,6 +1364,17 @@ class DefaultExecutionContext(ExecutionContext):
             # dont mix implicit and explicit returning
             assert not (iir and ier)
 
+            if iu and dml_statement._sort_by_parameter_order:
+                raise exc.InvalidRequestError(
+                    "The 'sort_by_parameter_order' argument to "
+                    "Update.returning() is only supported with ORM bulk "
+                    "UPDATE by primary key, i.e. "
+                    "Session.execute(update(Entity).returning(..., "
+                    "sort_by_parameter_order=True), list_of_mappings); "
+                    "it is not supported for direct Connection execution "
+                    "or for non-bulk ORM UPDATE statements."
+                )
+
             if (ier or iir) and compiled.for_executemany:
                 if ii and not self.dialect.insert_executemany_returning:
                     raise exc.InvalidRequestError(
