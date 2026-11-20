@@ -277,6 +277,24 @@ class ShardedSession(Session):
             )
 
             return obj
+        elif (
+            lazy_loaded_from is not None
+            and lazy_loaded_from.identity_token is not None
+        ):
+            # a relationship is being loaded on behalf of a parent row; both
+            # sides of a relationship are stored in the same shard, so only
+            # the parent's identity token is a candidate here.  consulting
+            # other shards could return an unrelated row that merely shares
+            # this primary key.  if the identity isn't present under the
+            # parent's token, the caller will emit SQL, which is likewise
+            # pinned to that token.
+            return super()._identity_lookup(
+                mapper,
+                primary_key_identity,
+                identity_token=lazy_loaded_from.identity_token,
+                lazy_loaded_from=lazy_loaded_from,
+                **kw,
+            )
         else:
             for shard_id in self.identity_chooser(
                 mapper,

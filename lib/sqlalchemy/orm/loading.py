@@ -1274,7 +1274,9 @@ def _load_subclass_via_in(
     else:
         q, enable_opt, disable_opt = mapper._subclass_load_via_in_mapper
 
-    def do_load(context, path, states, load_only, effective_entity):
+    def do_load(
+        context, path, states, load_only, effective_entity, identity_token=None
+    ):
         if not option_entities:
             # filter out states for those that would have selectinloaded
             # from another loader
@@ -1309,6 +1311,9 @@ def _load_subclass_via_in(
 
         if context.populate_existing:
             q2 = q2.execution_options(populate_existing=True)
+
+        if identity_token is not None:
+            q2 = q2.execution_options(identity_token=identity_token)
 
         while states:
             chunk = states[0 : SelectInLoader._chunksize]
@@ -1560,10 +1565,53 @@ class PostLoad:
                 for state, overwrite in self.states.items()
                 if state.manager.mapper.isa(limit_to_mapper)
             ]
-            if states:
-                loader(
-                    effective_context, path, states, self.load_keys, *arg, **kw
-                )
+            if not states:
+                continue
+
+            # partition the parent states according to the identity token
+            # they were loaded under.  the token is the only place the
+            # "where did this object come from" information is retained
+            # after the primary result has been consumed, and it's what
+            # distinguishes two rows that share a primary key across
+            # identity-token aware backends (e.g. sharded sessions).  each
+            # partition is loaded into its own batch so that a single
+            # secondary SELECT only carries the keys of one token and is
+            # itself executed against that token.
+            #
+            # when every state has the same token (the common case, and the
+            # only case for an ordinary Session), the loader is invoked
+            # once, exactly as before.
+            tokens = {state.identity_token for state, overwrite in states}
+            if len(tokens) <= 1:
+                grouped = [(next(iter(tokens)), states)]
+            else:
+                grouped_states = util.OrderedDict()
+                for state, overwrite in states:
+                    grouped_states.setdefault(state.identity_token, []).append(
+                        (state, overwrite)
+                    )
+                grouped = list(grouped_states.items())
+
+            for identity_token, token_states in grouped:
+                if identity_token is None:
+                    loader(
+                        effective_context,
+                        path,
+                        token_states,
+                        self.load_keys,
+                        *arg,
+                        **kw,
+                    )
+                else:
+                    loader(
+                        effective_context,
+                        path,
+                        token_states,
+                        self.load_keys,
+                        *arg,
+                        identity_token=identity_token,
+                        **kw,
+                    )
         self.states.clear()
 
     @classmethod

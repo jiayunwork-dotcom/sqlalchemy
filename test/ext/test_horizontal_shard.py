@@ -280,17 +280,16 @@ class ShardTest:
         bind_arguments = {}
 
         if limit_shard.none:
-            # right now selectinload / lazyload runs all the shards even if the
-            # ids are limited to just one shard, since that information
-            # is not transferred
-            counts = [2, 2, 2, 2]
-        elif limit_shard.lead_only:
-            if option_type.selectinload:
-                counts = [2, 0, 0, 0]
-            else:
-                counts = [2, 1, 1, 1]
-        elif limit_shard.bind_arg:
+            # the relationship loader receives the identity token of each
+            # parent row; it is emitted once for each shard that actually
+            # produced parent rows.  here that's only "north_america".
             counts = [2, 1, 1, 1]
+        elif limit_shard.lead_only:
+            # the primary query is limited to one shard, and the related
+            # rows are loaded from the shard the parents came from.
+            counts = [2, 0, 0, 0]
+        elif limit_shard.bind_arg:
+            counts = [2, 0, 0, 0]
         elif limit_shard.propagate_to_loaders:
             counts = [2, 0, 0, 0]
         else:

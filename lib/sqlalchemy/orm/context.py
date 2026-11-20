@@ -524,8 +524,28 @@ class ORMCompileState(AbstractORMCompileState):
 
         if "sa_top_level_orm_context" in execution_options:
             ctx = execution_options["sa_top_level_orm_context"]
-            execution_options = ctx.query._execution_options.merge_with(
-                ctx.execution_options, execution_options
+
+            # the top-level context carries the execution options of the
+            # primary query.  "yield_per" and the processed ORM load options
+            # describe how the *primary* cursor is being batched; they must
+            # not be re-applied to this secondary SELECT, else the loader
+            # query would appear to be a streaming query itself (and, for
+            # re-entrant executions such as one per identity token, would
+            # be re-interpreted as such each time).
+            top_level_execution_options = {
+                key: value
+                for key, value in ctx.execution_options.items()
+                if key not in ("yield_per", "_sa_orm_load_options")
+            }
+            top_level_query_execution_options = util.immutabledict(
+                {
+                    key: value
+                    for key, value in ctx.query._execution_options.items()
+                    if key not in ("yield_per", "_sa_orm_load_options")
+                }
+            )
+            execution_options = top_level_query_execution_options.merge_with(
+                top_level_execution_options, execution_options
             )
 
         if not execution_options:

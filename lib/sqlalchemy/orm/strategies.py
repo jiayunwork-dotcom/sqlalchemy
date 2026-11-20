@@ -1025,11 +1025,19 @@ class LazyLoader(
             _compile_options=ORMCompileState.default_compile_options,
         )
         load_options = QueryContext.default_load_options
+        identity_token = state.identity_token
 
         load_options += {
             "_invoke_all_eagers": False,
             "_lazy_loaded_from": state,
         }
+
+        if identity_token is not None:
+            # the parent row already identifies the identity token this
+            # related row must come from; pass it along so that the
+            # secondary SELECT is limited to that token (e.g. shard) and
+            # the rows it produces are given the same token.
+            load_options += {"_identity_token": identity_token}
 
         if self.parent_property.secondary is not None:
             stmt = stmt.select_from(
@@ -1425,6 +1433,7 @@ class ImmediateLoader(PostLoader):
         flags,
         recursion_depth,
         execution_options,
+        identity_token=None,
     ):
         if recursion_depth:
             new_opt = Load(loadopt.path.entity)
@@ -3150,6 +3159,7 @@ class SelectInLoader(PostLoader, util.MemoizedSlots):
         loadopt,
         recursion_depth,
         execution_options,
+        identity_token=None,
     ):
         if load_only and self.key not in load_only:
             return
@@ -3316,6 +3326,17 @@ class SelectInLoader(PostLoader, util.MemoizedSlots):
         q = q._update_compile_options({"_current_path": effective_path})
         if context.populate_existing:
             q = q.execution_options(populate_existing=True)
+
+        if identity_token is not None:
+            # all the parent states handed to this call share one identity
+            # token; pin the secondary SELECT to that token so that it is
+            # issued against the correct backend and only returns rows from
+            # there.  this takes effect for backends that interpret the
+            # token as a database selection (e.g. horizontal sharding);
+            # for ordinary sessions the token is None and nothing changes.
+            execution_options = execution_options.union(
+                {"identity_token": identity_token}
+            )
 
         if self.parent_property.order_by:
             if not query_info.load_with_join:
