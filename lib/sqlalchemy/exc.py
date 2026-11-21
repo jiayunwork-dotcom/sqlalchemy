@@ -447,6 +447,21 @@ class DontWrapMixin:
     """
 
 
+class PartitionTopologyError(InvalidRequestError, DontWrapMixin):
+    """A partition topology reflection request is outside of the supported
+    scope, or describes a hierarchy that cannot be represented.
+
+    This is raised by :meth:`_schema.MetaData.reflect` when
+    :paramref:`_schema.MetaData.reflect.postgresql_partition_topology` is
+    used with a request or database hierarchy that falls outside of the
+    documented scope of that option, as well as when a table named in
+    ``only`` is not a suitable hierarchy root.
+
+    .. versionadded:: 2.0.49
+
+    """
+
+
 class StatementError(SQLAlchemyError):
     """An error occurred during execution of a SQL statement.
 

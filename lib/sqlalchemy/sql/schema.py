@@ -32,6 +32,7 @@ from __future__ import annotations
 
 from abc import ABC
 import collections
+import dataclasses
 from enum import Enum
 import operator
 import typing
@@ -125,6 +126,18 @@ _ServerDefaultArgument = Union[
 ]
 
 _ServerOnUpdateArgument = _ServerDefaultArgument
+
+
+@dataclasses.dataclass
+class _PartitionReflectionPlan:
+    """Internal descriptive object for a partition topology reflection."""
+
+    schema: str
+    order: List[Tuple[str, str]]
+    records: Dict[Tuple[str, str], Dict[str, Any]]
+    depth: Dict[Tuple[str, str], int]
+    load: List[str]
+    load_keys: Set[str]
 
 
 class SchemaConst(Enum):
@@ -833,6 +846,10 @@ class Table(
         )._set_parent_with_dispatch(self)
         self.foreign_keys = set()  # type: ignore
         self._extra_dependencies: Set[Table] = set()
+        self._partition_parent_key: Optional[Tuple[Optional[str], str]] = None
+        self._partition_bound: Optional[str] = None
+        self._partition_is_default: bool = False
+        self._partition_key_def: Optional[str] = None
         if self.schema is not None:
             self.fullname = "%s.%s" % (self.schema, self.name)
         else:
@@ -1191,6 +1208,95 @@ class Table(
     def __str__(self) -> str:
         return _get_table_key(self.description, self.schema)
 
+    @property
+    def _partition_parent(self) -> Optional[Table]:
+        """Return the parent table in a PostgreSQL-style partition hierarchy.
+
+        This is populated when a partitioned table hierarchy is reflected
+        using
+        :paramref:`_schema.MetaData.reflect.postgresql_partition_topology`.
+        It is also carried over by :meth:`_schema.Table.to_metadata`, so that
+        the hierarchy is available on the copied tables as well.
+
+        """
+        if self._partition_parent_key is None:
+            return None
+        parent_schema, parent_name = self._partition_parent_key
+        return self.metadata.tables.get(
+            _get_table_key(parent_name, parent_schema)
+        )
+
+    @property
+    def partition_parent(self) -> Optional[Table]:
+        """Return the partition parent of this table, if any.
+
+        When a PostgreSQL partition hierarchy was reflected using
+        :paramref:`_schema.MetaData.reflect.postgresql_partition_topology`,
+        this attribute refers to the :class:`_schema.Table` object for the
+        table this one is a partition of.  For the root of a hierarchy, or
+        for a table that is not part of a reflected partition hierarchy,
+        this attribute is ``None``.
+
+        The value is resolved against the :class:`_schema.MetaData` that
+        currently owns this table, so it follows the table when copied using
+        :meth:`_schema.Table.to_metadata`.
+
+        """
+        return self._partition_parent
+
+    @property
+    def partition_bound(self) -> Optional[str]:
+        """Return the partition bound clause for this table, as SQL text.
+
+        For a partition that was reflected using
+        :paramref:`_schema.MetaData.reflect.postgresql_partition_topology`,
+        this is the text of the ``FOR VALUES ...`` / ``DEFAULT`` clause as
+        reported by PostgreSQL, e.g. ``"FOR VALUES FROM ('2024-01-01') TO
+        ('2025-01-01')"`` or ``"FOR VALUES IN ('a', 'b,c')"``.  This text is
+        used directly when emitting ``CREATE TABLE ... PARTITION OF ...``.
+
+        ``None`` is returned for a partitioning root, or for a table that is
+        not part of a reflected partition hierarchy.
+
+        """
+        return self._partition_bound
+
+    @property
+    def partition_is_default(self) -> bool:
+        """Whether this table is the ``DEFAULT`` partition of its parent.
+
+        .. seealso::
+
+            :attr:`_schema.Table.partition_bound`
+
+            :attr:`_schema.Table.partition_parent`
+
+        """
+        return self._partition_is_default
+
+    @property
+    def partition_key(self) -> Optional[str]:
+        """Return the partition key definition for a partitioned table.
+
+        This is the text of the ``PARTITION BY`` clause, e.g.
+        ``"RANGE (created)"`` or ``"LIST (kind)"``.  It is ``None`` for
+        non-partitioned tables, including leaf partitions.
+
+        """
+        return self._partition_key_def
+
+    @property
+    def partition_strategy(self) -> Optional[str]:
+        """Return ``"RANGE"`` or ``"LIST"`` for a partitioned table.
+
+        ``None`` is returned for non-partitioned tables.
+
+        """
+        key = self.partition_key
+        if not key:
+            return None
+        return key.split("(", 1)[0].strip().upper()
+
     def add_is_dependent_on(self, table: Table) -> None:
         """Add a 'dependency' for this Table.
 
@@ -1490,6 +1596,18 @@ class Table(
                 _table=table,
                 **index.kwargs,
             )
+
+        table._partition_bound = self._partition_bound
+        table._partition_is_default = self._partition_is_default
+        table._partition_key_def = self._partition_key_def
+        if self._partition_parent_key is not None:
+            parent_schema, parent_name = self._partition_parent_key
+            if parent_schema == self.schema:
+                table._partition_parent_key = (actual_schema, parent_name)
+            else:
+                table._partition_parent_key = self._partition_parent_key
+            metadata._resolve_partition_dependency(table)
+
         return self._schema_item_copy(table)
 
 
@@ -5555,6 +5673,7 @@ class MetaData(HasSchemaAttr):
         self._fk_memos: Dict[Tuple[str, Optional[str]], List[ForeignKey]] = (
             collections.defaultdict(list)
         )
+        self._pending_partition_dependencies: List[Table] = []
 
     tables: util.FacadeDict[str, Table]
     """A dictionary of :class:`_schema.Table`
@@ -5589,6 +5708,48 @@ class MetaData(HasSchemaAttr):
         self.tables._insert_item(key, table)
         if schema:
             self._schemas.add(schema)
+        # _add_table() is called before Table.__init__(), so the partition
+        # attributes may not be present on a newly constructed table
+        if getattr(table, "_partition_parent_key", None) is not None:
+            self._resolve_partition_dependency(table)
+
+    def _resolve_partition_dependency(self, table: Table) -> None:
+        """Establish the create-order dependency implied by partitioning.
+
+        Called for a table carrying partition topology information, once it
+        has been added to this :class:`_schema.MetaData`.  If its parent is
+        already present, the dependency is set up immediately; otherwise it
+        is recorded so that it can be established when the parent arrives.
+        This allows tables to be copied with :meth:`_schema.Table.to_metadata`
+        in any order.
+
+        """
+        parent_key = table._partition_parent_key
+        if parent_key is None:
+            return
+        parent = self.tables.get(_get_table_key(parent_key[1], parent_key[0]))
+        if parent is not None:
+            table.add_is_dependent_on(parent)
+        elif table not in self._pending_partition_dependencies:
+            self._pending_partition_dependencies.append(table)
+
+    def _settle_partition_dependencies(self) -> None:
+        pending = self._pending_partition_dependencies
+        if not pending:
+            return
+        remaining = []
+        for table in pending:
+            parent_key = table._partition_parent_key
+            if parent_key is None:
+                continue
+            parent = self.tables.get(
+                _get_table_key(parent_key[1], parent_key[0])
+            )
+            if parent is not None:
+                table.add_is_dependent_on(parent)
+            else:
+                remaining.append(table)
+        self._pending_partition_dependencies = remaining
 
     def _remove_table(self, name: str, schema: Optional[str]) -> None:
         key = _get_table_key(name, schema)
@@ -5596,6 +5757,12 @@ class MetaData(HasSchemaAttr):
         if removed is not None:
             for fk in removed.foreign_keys:
                 fk._remove_from_metadata(self)
+            if self._pending_partition_dependencies:
+                self._pending_partition_dependencies = [
+                    t
+                    for t in self._pending_partition_dependencies
+                    if t is not removed
+                ]
         if self._schemas:
             self._schemas = {
                 t.schema for t in self.tables.values() if t.schema is not None
@@ -5609,6 +5776,9 @@ class MetaData(HasSchemaAttr):
             "sequences": self._sequences,
             "fk_memos": self._fk_memos,
             "naming_convention": self.naming_convention,
+            "pending_partition_dependencies": (
+                self._pending_partition_dependencies
+            ),
         }
 
     def __setstate__(self, state: Dict[str, Any]) -> None:
@@ -5618,6 +5788,9 @@ class MetaData(HasSchemaAttr):
         self._sequences = state["sequences"]
         self._schemas = state["schemas"]
         self._fk_memos = state["fk_memos"]
+        self._pending_partition_dependencies = state.get(
+            "pending_partition_dependencies", []
+        )
 
     def clear(self) -> None:
         """Clear all Table objects from this MetaData."""
@@ -5625,6 +5798,7 @@ class MetaData(HasSchemaAttr):
         dict.clear(self.tables)
         self._schemas.clear()
         self._fk_memos.clear()
+        self._pending_partition_dependencies = []
 
     def remove(self, table: Table) -> None:
         """Remove the given Table object from this MetaData."""
@@ -5682,6 +5856,7 @@ class MetaData(HasSchemaAttr):
 
 
         """
+        self._settle_partition_dependencies()
         return ddl.sort_tables(
             sorted(self.tables.values(), key=lambda t: t.key)  # type: ignore
         )
@@ -5798,6 +5973,49 @@ class MetaData(HasSchemaAttr):
 
             :paramref:`_schema.Table.resolve_fks`
 
+        :param postgresql_partition_topology: boolean; when True, reflects
+         PostgreSQL declarative partition hierarchies described by the
+         tables named in :paramref:`_schema.MetaData.reflect.only`, including
+         every partition that is attached below them.
+
+         This option requires the PostgreSQL dialect, PostgreSQL 10 or
+         greater, an explicit :paramref:`_schema.MetaData.reflect.schema`
+         value, and :paramref:`_schema.MetaData.reflect.only` given as a
+         non-empty sequence of root table names.  Each name in ``only`` must
+         be the unpartitioned root of a hierarchy; it may not be a partition
+         of another table.  All partitions belonging to the selected roots
+         are reflected automatically and do not need to be listed.
+
+         The hierarchy is limited to the following scope; requests outside
+         of it raise :class:`_exc.ArgumentError`,
+         :class:`_exc.InvalidRequestError` or
+         :class:`_exc.NotSupportedError` before any tables are added to the
+         :class:`_schema.MetaData`:
+
+         * all tables must reside in the schema named by ``schema``;
+         * at most two levels of parent/child relationships are supported,
+           that is a root, its partitions, and partitions of those;
+         * only ``RANGE`` and ``LIST`` partition strategies are supported,
+           with partition keys that reference integer, date or text columns
+           (expression keys and multi-column keys are not supported);
+         * a table may have at most one parent, and every non-root table in
+           the hierarchy must be a declarative partition, not a table linked
+           by traditional ``INHERITS``.
+
+         Each reflected :class:`_schema.Table` exposes its place in the
+         hierarchy through :attr:`_schema.Table.partition_parent`,
+         :attr:`_schema.Table.partition_bound`,
+         :attr:`_schema.Table.partition_is_default`,
+         :attr:`_schema.Table.partition_key` and
+         :attr:`_schema.Table.partition_strategy`.  Parent tables are also
+         established as creation dependencies of their partitions, so that
+         :attr:`_schema.MetaData.sorted_tables` and
+         :meth:`_schema.MetaData.create_all` order parent tables before
+         their partitions.  These attributes are preserved by
+         :meth:`_schema.Table.to_metadata`.
+
+         .. versionadded:: 2.0.49
+
         :param \**dialect_kwargs: Additional keyword arguments not mentioned
          above are dialect specific, and passed in the form
          ``<dialectname>_<argname>``.  See the documentation regarding an
@@ -5816,6 +6034,10 @@ class MetaData(HasSchemaAttr):
             reflect tables using general types.
 
         """
+
+        partition_topology = bool(
+            dialect_kwargs.pop("postgresql_partition_topology", False)
+        )
 
         with inspection.inspect(bind)._inspection_context() as insp:
             reflect_opts: Any = {
@@ -5859,7 +6081,19 @@ class MetaData(HasSchemaAttr):
 
             current = set(self.tables)
 
-            if only is None:
+            partition_plan = None
+            if partition_topology:
+                partition_plan = self._reflect_partition_topology(
+                    insp=insp,
+                    schema=schema,
+                    only=only,
+                    available=available,
+                    current=current,
+                    extend_existing=extend_existing,
+                    dialect_kwargs=dialect_kwargs,
+                )
+                load = partition_plan.load
+            elif only is None:
                 load = [
                     name
                     for name, schname in zip(available, available_w_schema)
@@ -5898,11 +6132,376 @@ class MetaData(HasSchemaAttr):
             )
             reflect_opts["_reflect_info"] = _reflect_info
 
-            for name in load:
-                try:
-                    Table(name, self, **reflect_opts)
-                except exc.UnreflectableTableError as uerr:
-                    util.warn(f"Skipping table {name}: {uerr}")
+            if partition_plan is not None:
+                self._load_partition_topology(partition_plan, reflect_opts)
+            else:
+                for name in load:
+                    try:
+                        Table(name, self, **reflect_opts)
+                    except exc.UnreflectableTableError as uerr:
+                        util.warn(f"Skipping table {name}: {uerr}")
+
+    def _reflect_partition_topology(
+        self,
+        insp: Any,
+        schema: Optional[str],
+        only: Any,
+        available: Any,
+        current: Any,
+        extend_existing: bool,
+        dialect_kwargs: Dict[str, Any],
+    ) -> "_PartitionReflectionPlan":
+        """Validate the request and lay out a partition topology reflection.
+
+        This method is invoked by :meth:`_schema.MetaData.reflect` when the
+        ``postgresql_partition_topology`` flag is passed.  It performs all
+        validation up front, so that an invalid request fails before any
+        :class:`_schema.Table` objects have been added to this
+        :class:`_schema.MetaData`.
+
+        """
+        dialect = insp.dialect
+
+        if dialect.name != "postgresql":
+            raise exc.ArgumentError(
+                "postgresql_partition_topology is only supported by the "
+                "PostgreSQL dialect; got dialect %r" % dialect.name
+            )
+        if (
+            not hasattr(dialect, "get_partition_topology")
+            or dialect.server_version_info is None
+            or dialect.server_version_info < (10,)
+        ):
+            raise exc.PartitionTopologyError(
+                "postgresql_partition_topology requires PostgreSQL 10 or "
+                "greater"
+            )
+
+        if schema is None:
+            raise exc.ArgumentError(
+                "postgresql_partition_topology requires that the 'schema' "
+                "parameter be specified explicitly"
+            )
+
+        if only is None or callable(only):
+            raise exc.ArgumentError(
+                "postgresql_partition_topology requires 'only' to be a "
+                "non-empty sequence of root table names"
+            )
+
+        roots = [name for name in only]
+        if not roots:
+            raise exc.ArgumentError(
+                "postgresql_partition_topology requires 'only' to be a "
+                "non-empty sequence of root table names"
+            )
+
+        if len(set(roots)) != len(roots):
+            dupes = sorted({n for n in roots if roots.count(n) > 1})
+            raise exc.ArgumentError(
+                "postgresql_partition_topology received duplicate root "
+                "table name(s): %s" % ", ".join(repr(n) for n in dupes)
+            )
+
+        missing = [name for name in roots if name not in available]
+        if missing:
+            raise exc.InvalidRequestError(
+                "Could not reflect: requested table(s) not available in "
+                "%r schema '%s': (%s)"
+                % (insp.engine, schema, ", ".join(missing))
+            )
+
+        records = dialect.get_partition_topology(
+            insp.bind,
+            schema,
+            roots,
+            info_cache=insp.info_cache,
+        )
+
+        return self._plan_partition_topology(
+            schema=schema,
+            roots=roots,
+            records=records,
+            current=current,
+            extend_existing=extend_existing,
+        )
+
+    def _plan_partition_topology(
+        self,
+        schema: str,
+        roots: List[str],
+        records: _typing_Sequence[Dict[str, Any]],
+        current: Any,
+        extend_existing: bool,
+    ) -> "_PartitionReflectionPlan":
+        by_key: Dict[Tuple[str, str], Dict[str, Any]] = {}
+        for rec in records:
+            by_key[(rec["schema"], rec["name"])] = rec
+
+        # every requested root must exist in the database
+        for root in roots:
+            if (schema, root) not in by_key:
+                raise exc.NoSuchTableError(root)
+
+        # Determine the effective set of hierarchy roots.  A name in
+        # ``only`` that is a descendant of another name in ``only`` is
+        # redundant rather than an error; any name that is either a genuine
+        # root or a descendant of one of the selected roots is accepted.  A
+        # name that is a partition of a table that was not selected is
+        # rejected, because its hierarchy cannot be faithfully reflected as
+        # an independent root.
+        proposed = set(roots)
+
+        def _ancestor_names(name):
+            chain = []
+            rec = by_key[(schema, name)]
+            while rec["parent_name"] is not None:
+                parent_key = (rec["parent_schema"], rec["parent_name"])
+                if parent_key in chain:
+                    break
+                chain.append(parent_key)
+                if parent_key not in by_key:
+                    break
+                rec = by_key[parent_key]
+            return [parent_name for (_, parent_name) in chain]
+
+        for root in roots:
+            rec = by_key[(schema, root)]
+            if rec["relkind"] == "f":
+                raise exc.PartitionTopologyError(
+                    "foreign table %r cannot be used as a partition "
+                    "hierarchy root" % root
+                )
+            if rec["parent_count"]:
+                # acceptable only if some ancestor is also selected
+                if not any(anc in proposed for anc in _ancestor_names(root)):
+                    what = (
+                        "is itself a partition of"
+                        if rec["is_partition"]
+                        else "is attached to a parent table"
+                    )
+                    raise exc.PartitionTopologyError(
+                        "table %r %s %r and cannot be used as a partition "
+                        "hierarchy root; name the root of the hierarchy "
+                        "instead" % (root, what, rec["parent_name"])
+                    )
+            elif rec["relkind"] != "p":
+                raise exc.PartitionTopologyError(
+                    "table %r is not a partitioned table and cannot be "
+                    "reflected as a partition hierarchy root; only "
+                    "declaratively partitioned tables may be named in "
+                    "'only'" % root
+                )
+
+        effective_roots = [
+            root
+            for root in roots
+            if not by_key[(schema, root)]["parent_count"]
+        ]
+
+        # walk each hierarchy, enforcing the supported scope
+        tables_in_order: List[Tuple[str, str]] = []
+        seen: Dict[Tuple[str, str], int] = {}
+        for root in effective_roots:
+            stack = [(schema, root, 0)]
+            # depth inside the tree; root is depth 0
+            while stack:
+                tbl_schema, name, depth = stack.pop()
+                key = (tbl_schema, name)
+                if key in seen:
+                    continue
+                seen[key] = depth
+                tables_in_order.append(key)
+                children = [
+                    rec
+                    for rec in records
+                    if rec["parent_schema"] == tbl_schema
+                    and rec["parent_name"] == name
+                ]
+                for child in children:
+                    stack.append((child["schema"], child["name"], depth + 1))
+
+        for key in tables_in_order:
+            rec = by_key[key]
+            depth = seen[key]
+            name = rec["name"]
+
+            if depth > 2:
+                raise exc.PartitionTopologyError(
+                    "postgresql_partition_topology supports at most two "
+                    "levels of parent/child edges; table %r is at depth %d"
+                    % (name, depth)
+                )
+
+            if rec["schema"] != schema:
+                raise exc.PartitionTopologyError(
+                    "postgresql_partition_topology does not support "
+                    "partitions in a different schema; table %r is in "
+                    "schema %r, expected %r" % (name, rec["schema"], schema)
+                )
+
+            if rec["parent_count"] > 1:
+                raise exc.PartitionTopologyError(
+                    "postgresql_partition_topology does not support a "
+                    "table with multiple parents; table %r" % name
+                )
+
+            if rec["has_expressions"]:
+                raise exc.PartitionTopologyError(
+                    "postgresql_partition_topology does not support "
+                    "expression-based partition keys; table %r" % name
+                )
+
+            strategy = rec["strategy"]
+            if strategy is not None:
+                if strategy.upper() not in ("RANGE", "LIST"):
+                    raise exc.PartitionTopologyError(
+                        "postgresql_partition_topology supports only RANGE "
+                        "and LIST partitioning; table %r uses %r"
+                        % (name, strategy.upper())
+                    )
+                if len(rec["key_columns"]) != 1:
+                    raise exc.PartitionTopologyError(
+                        "postgresql_partition_topology supports a single "
+                        "partition key column; table %r has %d"
+                        % (name, len(rec["key_columns"]))
+                    )
+                for col_type in rec["key_types"]:
+                    category = self._partition_type_category(col_type)
+                    if category not in ("integer", "date", "text"):
+                        raise exc.PartitionTopologyError(
+                            "postgresql_partition_topology supports "
+                            "integer, date and text partition keys; table "
+                            "%r uses column type %r" % (name, col_type)
+                        )
+                if rec["relkind"] != "p":
+                    raise exc.PartitionTopologyError(
+                        "table %r reports a partition key but is not a "
+                        "partitioned table" % name
+                    )
+            elif rec["has_children"]:
+                raise exc.PartitionTopologyError(
+                    "table %r has children but does not report a "
+                    "partition key" % name
+                )
+
+            # non-partitioned descendants must be genuine partitions
+            if depth > 0 and not rec["is_partition"]:
+                raise exc.PartitionTopologyError(
+                    "table %r is linked to its parent by traditional "
+                    "inheritance, not partitioning; postgresql_"
+                    "partition_topology does not support inheritance "
+                    "hierarchies" % name
+                )
+
+            if depth > 0:
+                if rec["relkind"] not in ("r", "p"):
+                    raise exc.PartitionTopologyError(
+                        "partition %r has unsupported relation kind %r"
+                        % (name, rec["relkind"])
+                    )
+                if rec["bound"] is None:
+                    raise exc.PartitionTopologyError(
+                        "partition %r does not report a partition bound" % name
+                    )
+
+        load = [
+            name
+            for (tbl_schema, name) in tables_in_order
+            if extend_existing
+            or _get_table_key(name, tbl_schema) not in current
+        ]
+        load_keys = {
+            _get_table_key(name, tbl_schema)
+            for (tbl_schema, name) in tables_in_order
+            if extend_existing
+            or _get_table_key(name, tbl_schema) not in current
+        }
+        return _PartitionReflectionPlan(
+            schema=schema,
+            order=tables_in_order,
+            records=by_key,
+            depth=seen,
+            load=load,
+            load_keys=load_keys,
+        )
+
+    @staticmethod
+    def _partition_type_category(type_name: Optional[str]) -> str:
+        if type_name is None:
+            return "unknown"
+        name = type_name.lower()
+        if name in (
+            "int2",
+            "int4",
+            "int8",
+            "smallint",
+            "integer",
+            "bigint",
+            "oid",
+        ):
+            return "integer"
+        if name.startswith("timestamp") or name in ("date",):
+            return "date"
+        if name in (
+            "text",
+            "varchar",
+            "character varying",
+            "char",
+            "character",
+            "bpchar",
+            "name",
+        ):
+            return "text"
+        return "other"
+
+    def _load_partition_topology(
+        self,
+        plan: "_PartitionReflectionPlan",
+        reflect_opts: Dict[str, Any],
+    ) -> None:
+        """Create the reflected tables described by *plan*.
+
+        Tables are created root first.  Each table is fully populated before
+        its children are created, and every created table is tracked so that
+        a failure part way through can be rolled back, leaving this
+        :class:`_schema.MetaData` as it was before the call.
+
+        """
+        created: List[str] = []
+        try:
+            for tbl_schema, name in plan.order:
+                key = _get_table_key(name, tbl_schema)
+                if key not in plan.load_keys:
+                    # already present, and extend_existing was not requested
+                    continue
+                existing = self.tables.get(key)
+                table = Table(name, self, **reflect_opts)
+                if existing is None:
+                    created.append(key)
+                rec = plan.records[(tbl_schema, name)]
+                depth = plan.depth[(tbl_schema, name)]
+
+                if depth > 0:
+                    table._partition_parent_key = (
+                        rec["parent_schema"],
+                        rec["parent_name"],
+                    )
+                    table._partition_bound = rec["bound"]
+                    table._partition_is_default = rec["is_default"]
+                    self._resolve_partition_dependency(table)
+
+                if rec["strategy"] is not None:
+                    table._partition_key_def = rec["key_definition"]
+                    table.dialect_options["postgresql"]["partition_by"] = rec[
+                        "key_definition"
+                    ]
+        except Exception:
+            for key in reversed(created):
+                if key in self.tables:
+                    stale = self.tables[key]
+                    self._remove_table(stale.name, stale.schema)
+            raise
 
     def create_all(
         self,

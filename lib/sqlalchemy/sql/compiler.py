@@ -6814,6 +6814,11 @@ class DDLCompiler(Compiled):
         table = create.element
         preparer = self.preparer
 
+        if self._table_is_created_as_partition(table):
+            return self.visit_create_partition(
+                create, table._partition_parent, **kw
+            )
+
         text = "\nCREATE "
         if table._prefixes:
             text += " ".join(table._prefixes) + " "
@@ -7119,6 +7124,32 @@ class DDLCompiler(Compiled):
 
     def create_table_suffix(self, table):
         return ""
+
+    def _table_is_created_as_partition(self, table):
+        """Return True if *table* is rendered as a partition of its parent.
+
+        Only :attr:`_schema.Table.partition_parent` being present, together
+        with a recorded partition bound, triggers partition DDL; ordinary
+        tables are unaffected.
+
+        """
+        return (
+            getattr(table, "_partition_bound", None) is not None
+            and table._partition_parent is not None
+        )
+
+    def visit_create_partition(self, create, parent, **kw):
+        """Render a ``CREATE TABLE ... PARTITION OF`` statement.
+
+        This method is consulted from :meth:`.DDLCompiler.visit_create_table`
+        for a table that is a partition of another table present in the same
+        :class:`_schema.MetaData`; that is, a table for which
+        :attr:`_schema.Table.partition_parent` is not ``None``.
+
+        """
+        raise NotImplementedError(
+            "%r does not support partitioned DDL" % self.dialect.name
+        )
 
     def post_create_table(self, table):
         return ""

@@ -1136,6 +1136,92 @@ construct, the DBAPI's "autocommit" mode must be used::
 
     :ref:`postgresql_isolation_level`
 
+.. _postgresql_partition_reflection:
+
+PostgreSQL Partition Hierarchy Reflection
+------------------------------------------
+
+A PostgreSQL declaratively partitioned table is a parent table with a
+``PARTITION BY`` clause, and a series of child tables created with
+``PARTITION OF ... FOR VALUES ...``.  Reflecting such a table with an
+ordinary :meth:`_schema.MetaData.reflect` or ``Table(..., autoload_with=...)``
+call yields each table separately, with no record of how the tables are
+attached to each other.
+
+Passing :paramref:`_schema.MetaData.reflect.postgresql_partition_topology`
+causes the hierarchy to be reflected as a connected set of
+:class:`_schema.Table` objects instead::
+
+    metadata = MetaData()
+    metadata.reflect(
+        connection,
+        schema="accounting",
+        only=["events"],
+        postgresql_partition_topology=True,
+    )
+
+    events = metadata.tables["accounting.events"]
+    for partition in metadata.tables.values():
+        if partition.partition_parent is events:
+            print(partition.name, partition.partition_bound)
+
+Above, ``only`` names one or more hierarchy roots; every partition attached
+below each root is reflected automatically.  The option requires that
+``schema`` be specified explicitly, and that ``only`` be a non-empty
+sequence of root table names.
+
+Each reflected table exposes the following attributes:
+
+* :attr:`_schema.Table.partition_parent` - the parent :class:`_schema.Table`,
+  or ``None`` for a hierarchy root
+* :attr:`_schema.Table.partition_bound` - the ``FOR VALUES ...`` or
+  ``DEFAULT`` clause, verbatim from PostgreSQL
+* :attr:`_schema.Table.partition_is_default` - whether the table is the
+  ``DEFAULT`` partition of its parent
+* :attr:`_schema.Table.partition_key` - the ``PARTITION BY`` clause of a
+  partitioned table, e.g. ``"RANGE (created)"``
+* :attr:`_schema.Table.partition_strategy` - ``"RANGE"`` or ``"LIST"``
+
+The hierarchy is not lost when the tables are copied to another
+:class:`_schema.MetaData`.  :meth:`_schema.Table.to_metadata` carries the
+topology across, rewriting parent references to the target schema; the
+copied tables may be produced in any order::
+
+    target = MetaData()
+    for table in metadata.tables.values():
+        table.to_metadata(target, schema="accounting_copy")
+
+    target.sorted_tables  # parents are emitted before their partitions
+    target.create_all(connection)
+
+Note that a child table copied with :meth:`_schema.Table.to_metadata`
+renders as ``CREATE TABLE ... PARTITION OF ...`` when created, rather than
+as an independent table; any indexes and constraints on the partition are
+created by PostgreSQL itself as part of that statement.
+
+The supported scope is intentionally narrow, and is validated before any
+tables are added to the target :class:`_schema.MetaData`:
+
+* all tables in a hierarchy must be in the schema named by ``schema``
+* at most two levels of parent/child relationships, i.e. a root, its
+  partitions, and partitions of those
+* only ``RANGE`` and ``LIST`` strategies, with partition keys that reference
+  integer, date or text columns; expression keys are not supported
+* every non-root table must be a declarative partition, not a table attached
+  by traditional ``INHERITS``
+* each name in ``only`` must be either a hierarchy root or a partition of
+  another selected root; naming an individual sub-partition as its own root
+  is not supported
+
+Requests outside of this scope, as well as hierarchies that violate it,
+raise :class:`_exc.PartitionTopologyError`.
+
+.. versionadded:: 2.0.49
+
+.. seealso::
+
+    :paramref:`_schema.MetaData.reflect.postgresql_partition_topology`
+
 .. _postgresql_index_reflection:
 
 PostgreSQL Index Reflection
@@ -1694,6 +1780,12 @@ from ...types import VARCHAR
 from ...util.typing import TypedDict
 
 IDX_USING = re.compile(r"^(?:btree|hash|gist|gin|[\w_]+)$", re.I)
+
+_PARTITION_STRATEGIES = {
+    "r": "RANGE",
+    "l": "LIST",
+    "h": "HASH",
+}
 
 RESERVED_WORDS = {
     "all",
@@ -2688,6 +2780,26 @@ class PGDDLCompiler(compiler.DDLCompiler):
 
         return "".join(table_opts)
 
+    def visit_create_partition(self, create, parent, **kw):
+        table = create.element
+        preparer = self.preparer
+
+        text = "\nCREATE TABLE "
+        if create.if_not_exists:
+            text += "IF NOT EXISTS "
+        text += preparer.format_table(table)
+        text += "\n PARTITION OF "
+        text += preparer.format_table(parent)
+        text += " %s" % table._partition_bound
+
+        pg_opts = table.dialect_options["postgresql"]
+        if pg_opts["partition_by"]:
+            text += "\n PARTITION BY %s" % pg_opts["partition_by"]
+        if pg_opts["tablespace"]:
+            text += "\n TABLESPACE %s" % preparer.quote(pg_opts["tablespace"])
+
+        return text + "\n\n"
+
     def visit_computed_column(self, generated, **kw):
         if generated.persisted is False:
             raise exc.CompileError(
@@ -3662,6 +3774,134 @@ class PGDialect(default.DefaultDialect):
             pg_catalog.RELKINDS_TABLE_NO_FOREIGN,
             scope=ObjectScope.DEFAULT,
         )
+
+    def get_partition_topology(self, connection, schema, root_names, **kw):
+        """Return partition hierarchy information for a set of root tables.
+
+        This is the backend query used by
+        :paramref:`_schema.MetaData.reflect.postgresql_partition_topology`.
+        It returns one record per table in each requested hierarchy, in
+        root-first order, describing the parent/child linkage, the partition
+        strategy and key of each partitioned level, and the bound of each
+        partition.
+
+        Only a single round trip is used regardless of the size of the
+        hierarchies.
+
+        """
+        if not root_names:
+            return []
+
+        statement = sql.text(self._partition_topology_sql).bindparams(
+            bindparam("root_names", expanding=True)
+        )
+        rows = connection.execute(
+            statement,
+            {"schema": schema, "root_names": list(root_names)},
+        ).mappings()
+
+        result = []
+        for row in rows:
+            key_names = row["key_names"]
+            if key_names is None:
+                key_names = []
+            result.append(
+                {
+                    "schema": row["table_schema"],
+                    "name": row["table_name"],
+                    "oid": row["oid"],
+                    "relkind": row["relkind"],
+                    "is_partition": bool(row["is_partition"]),
+                    "depth": row["depth"],
+                    "parent_count": row["parent_count"],
+                    "parent_schema": row["parent_schema"],
+                    "parent_name": row["parent_name"],
+                    "has_children": bool(row["has_children"]),
+                    "bound": row["bound"],
+                    "is_default": (row["bound"] or "").strip().upper()
+                    == "DEFAULT",
+                    "strategy": _PARTITION_STRATEGIES.get(row["strategy"]),
+                    "key_definition": row["key_definition"],
+                    "key_columns": list(key_names),
+                    "key_types": list(row["key_types"] or ()),
+                    "has_expressions": row["partexprs"] is not None,
+                }
+            )
+        return result
+
+    _partition_topology_sql = r"""
+WITH RECURSIVE partition_tree(relid, depth) AS (
+    SELECT c.oid, 0
+    FROM pg_catalog.pg_class c
+    JOIN pg_catalog.pg_namespace n ON n.oid = c.relnamespace
+    WHERE n.nspname = :schema AND c.relname IN :root_names
+    UNION ALL
+    SELECT i.inhrelid, t.depth + 1
+    FROM partition_tree t
+    JOIN pg_catalog.pg_inherits i ON i.inhparent = t.relid
+),
+tree_tables AS (
+    SELECT c.oid,
+           n.nspname AS table_schema,
+           c.relname AS table_name,
+           c.relkind,
+           c.relispartition AS is_partition,
+           c.relpartbound,
+           min(t.depth) AS depth
+    FROM partition_tree t
+    JOIN pg_catalog.pg_class c ON c.oid = t.relid
+    JOIN pg_catalog.pg_namespace n ON n.oid = c.relnamespace
+    GROUP BY c.oid, n.nspname, c.relname, c.relkind,
+             c.relispartition, c.relpartbound
+)
+SELECT tt.oid,
+       tt.table_schema,
+       tt.table_name,
+       tt.relkind,
+       tt.is_partition,
+       tt.depth,
+       (SELECT count(*) FROM pg_catalog.pg_inherits pi
+         WHERE pi.inhrelid = tt.oid) AS parent_count,
+       pc.relname AS parent_name,
+       pn.nspname AS parent_schema,
+       pg_catalog.pg_get_expr(tt.relpartbound, tt.oid) AS bound,
+       pt.partstrat AS strategy,
+       pg_catalog.pg_get_partkeydef(tt.oid) AS key_definition,
+       pt.partexprs::text AS partexprs,
+       (SELECT array_agg(a.attname ORDER BY u.ord)
+          FROM pg_catalog.unnest(
+                pg_catalog.string_to_array(pt.partattrs::text, ' ')
+                ::int2[]
+              ) WITH ORDINALITY u(attnum, ord)
+          JOIN pg_catalog.pg_attribute a
+            ON a.attrelid = pt.partrelid AND a.attnum = u.attnum
+       ) AS key_names,
+       (SELECT array_agg(ty.typname ORDER BY u.ord)
+          FROM pg_catalog.unnest(
+                pg_catalog.string_to_array(pt.partattrs::text, ' ')
+                ::int2[]
+              ) WITH ORDINALITY u(attnum, ord)
+          JOIN pg_catalog.pg_attribute a
+            ON a.attrelid = pt.partrelid AND a.attnum = u.attnum
+          JOIN pg_catalog.pg_type ty ON ty.oid = a.atttypid
+       ) AS key_types,
+       EXISTS (
+           SELECT 1 FROM pg_catalog.pg_inherits ii
+           WHERE ii.inhparent = tt.oid
+       ) AS has_children
+FROM tree_tables tt
+LEFT JOIN pg_catalog.pg_partitioned_table pt ON pt.partrelid = tt.oid
+LEFT JOIN LATERAL (
+    SELECT pi.inhparent
+    FROM pg_catalog.pg_inherits pi
+    WHERE pi.inhrelid = tt.oid
+    ORDER BY pi.inhseqno
+    LIMIT 1
+) pinfo ON true
+LEFT JOIN pg_catalog.pg_class pc ON pc.oid = pinfo.inhparent
+LEFT JOIN pg_catalog.pg_namespace pn ON pn.oid = pc.relnamespace
+ORDER BY tt.depth, tt.table_schema, tt.table_name
+"""
 
     @reflection.cache
     def get_temp_table_names(self, connection, **kw):

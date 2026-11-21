@@ -919,14 +919,75 @@ class SchemaGenerator(InvokeCreateDDLBase):
         self.preparer = dialect.identifier_preparer
         self.dialect = dialect
         self.memo = {}
+        self._can_create_table_cache = {}
 
     def _can_create_table(self, table):
+        cache = self._can_create_table_cache
+        key = table.key
+        if key in cache:
+            return cache[key]
+        result = cache[key] = self._can_create_table_uncached(table)
+        return result
+
+    def _can_create_table_uncached(self, table):
         self.dialect.validate_identifier(table.name)
         effective_schema = self.connection.schema_for_object(table)
         if effective_schema:
             self.dialect.validate_identifier(effective_schema)
+        if self._partition_ancestor_is_created(table):
+            # a partition of a table that is itself being created in this
+            # run cannot already exist; skip the per-table existence probe
+            return True
         return not self.checkfirst or not self.dialect.has_table(
             self.connection, table.name, schema=effective_schema
+        )
+
+    def _partition_ancestor_is_created(self, table):
+        """Return True if a table this one is partitioned from is being
+        created in this run.
+
+        """
+        if getattr(table, "_partition_bound", None) is None:
+            return False
+        parent = table._partition_parent
+        if parent is None:
+            return False
+        return self._can_create_table(parent)
+
+    def _index_created_by_partition_of(self, table, index):
+        """Whether *index* is created by PostgreSQL with the partition.
+
+        When a table is emitted as ``CREATE TABLE ... PARTITION OF``, an
+        index is created automatically for each index on the parent.   That
+        automatic index uses a name PostgreSQL generates from the partition
+        table name and the index column names.  An index carrying that same
+        generated name is skipped here; an explicitly named index is still
+        emitted, since PostgreSQL will not have created one under that name.
+
+        """
+        if not self._is_partition_table(table):
+            return False
+        return index.name == self._inherited_index_name(table, index)
+
+    def _inherited_index_name(self, table, index):
+        """Best-effort name PostgreSQL generates for an inherited index."""
+        return "%s_%s_idx" % (
+            table.name,
+            "_".join(c.name for c in index.columns),
+        )
+
+    @staticmethod
+    def _is_partition_table(table):
+        """Return True if *table* is to be created as a partition.
+
+        Partition tables are created with ``CREATE TABLE ... PARTITION OF``;
+        PostgreSQL creates any indexes and constraints on the partition
+        itself, so these must not be emitted separately.
+
+        """
+        return (
+            getattr(table, "_partition_bound", None) is not None
+            and table._partition_parent is not None
         )
 
     def _can_create_index(self, index):
@@ -959,6 +1020,7 @@ class SchemaGenerator(InvokeCreateDDLBase):
         else:
             tables = list(metadata.tables.values())
 
+        metadata._settle_partition_dependencies()
         collection = sort_tables_and_constraints(
             [t for t in tables if self._can_create_table(t)]
         )
@@ -1023,6 +1085,10 @@ class SchemaGenerator(InvokeCreateDDLBase):
 
             if hasattr(table, "indexes"):
                 for index in table.indexes:
+                    if self._index_created_by_partition_of(table, index):
+                        # PostgreSQL creates this index automatically as the
+                        # partition's copy of an ancestor index
+                        continue
                     self.traverse_single(index, create_ok=True)
 
             if (
@@ -1082,6 +1148,7 @@ class SchemaDropper(InvokeDropDDLBase):
 
         try:
             unsorted_tables = [t for t in tables if self._can_drop_table(t)]
+            metadata._settle_partition_dependencies()
             collection = list(
                 reversed(
                     sort_tables_and_constraints(
